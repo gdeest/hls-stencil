@@ -1,0 +1,16 @@
+#define ST 2
+#define S0 8
+#define S1 8
+#define UNROLLFAC 2
+#define ST 2
+#define S0 8
+#define S1 8
+#define UNROLLFAC 2
+#define ST 2
+#define S0 8
+#define S1 8
+#define UNROLLFAC 2
+#define ST 2
+#define S0 8
+#define S1 8
+#define UNROLLFAC 2

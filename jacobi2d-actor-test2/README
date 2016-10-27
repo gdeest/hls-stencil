@@ -1,0 +1,134 @@
+Stencil Specification
+ - 5pt stencil over 2D data 
+ - One variable being updated: B (this is why the name B shows up in some functions, variables)
+ - Skew is t,i,j -> t,i+t,j+t
+
+Assumptions
+ - Only works for 3D iteration space
+ - Unroll innermost dimensions only
+ - Unroll factor evenly divides the tile size
+
+Conventions
+ - Dimensions are counted from 0: so we have 0,1,2
+ - T : problem size in dim 0
+ - N : problem size in dim 1 and 2
+       (you can easily extend to rectangular inputs by updating the definitions of Nx and NTx)
+ - Nx  : problem size in dim x after skewing
+ - NTx : number of tiles in dim x, after skewing. Can be computed as (Nx + Sx-1)/Sx
+ - Sx  : tile sizes in dim x
+ - HALO_x : halo size in dim x, defined as the longest distance reached by the skewed dependence in each dimension
+ - FACE_Px : size of the tile face normal to the axis x
+ - FACE_Px_y : edge of the rectangle defined face x in dim y
+ 
+ - The following domain is the basic view of a tile + halo.
+ [S0,S1,S2] -> { 0<=t<S0+HALO_0 and 0<=i<S1+HALO_1 and 0<=j<S2+HALO_2}
+
+Memory Allocation
+  The memory allocation used aims at enabling contiguous accesses to the tile
+faces, including halo inputs for both reads and writes. There are three
+separate projections for each face of a tile, and one auxiliary array for
+storing the corner of the halo. Each projection is responsible for a face and
+the halo extended in one out of the three dimensions. You cannot have a face to
+be extended in two or more dimensions to satisfy the contiguity criteria, and
+hence the need for the auxiliary array.
+
+The projection along t, named Pt, is responsible for storing the face normal to
+t, as well as its extension to i. In other words, it corresponds to the following:
+
+ [S0,S1,S2] -> { 0<=t<HALO_0 and 0<=i<S1+HALO_1 and HALO_2<=j<S2+HALO_2}
+
+note that t only spans width HALO_0, i spans the entire domain, and j only spans width S2.
+
+Similarly, Pi and Pj corresponds to the following:
+
+ [S0,S1,S2] -> { HALO_0<=t<S0+HALO_0 and 0<=i<HALO_1 and 0<=j<S2+HALO_2} //Pi
+ [S0,S1,S2] -> { 0<=t<S0+HALO_0 and HALO_1<=i<S1+HALO_1 and 0<=j<HALO_2} //Pj
+
+The convention is that a projection along x will cover the face + the halo
+extend in the x+1th dimension, 0 when x is the last dim. This face + halo
+region is mapped to memory so that the projected dimension, or the thickness of
+the face, is the innermost dimension. The other constraint is that the extended
+dimension that includes the halo must be outermost to allow for both reads and writes
+to be contiguous. Hence the face mapping can be expressed as the following:
+
+  Pt : [t,i,j] -> [i,j,t%HALO_0]
+  Pi : [t,i,j] -> [j,t,i%HALO_1]
+  Pj : [t,i,j] -> [t,i,j%HALO_2]
+
+Then the faces from all the tiles are also laid out, this time with the
+extended dimension as the innermost (the projected dimension is dropped since
+this is the direction of memory reuse). This allows the two tiles along the
+extended dimension to have contiguous memory layout.
+
+ Pt : [tt,ti,tj] -> [tj,ti]
+ Pi : [tt,ti,tj] -> [tt,tj]
+ Pj : [tt,ti,tj] -> [ti,tt]
+
+However, this violates the dependences since the input halo region is
+overwritten before its last use. This can be avoided by slightly shifting the
+write to the same location (i.e., for each iteration of the dimension along the
+projection).
+
+ Pt : shift the write for each tt by the halo size = HALO_0 x HALO_1 x S2
+ Pi : shift the write for each ti by the halo size = S0 x HALO_1 x HALO_2
+ Pj : shift the write for each tj by the halo size = HALO_0 x S1 x HALO_2
+
+You have to shift in the negative direction to avoid overwriting, and hence you need
+to offset the access function by halo size x number of tiles in the corresponding dim.
+
+The implementation of all the above combined is the following:
+
+#define B_P0_offset(tt, ti, tj, t, i, j) (tj)*(HALO_0*(N1+HALO_1)*S2)+(ti)*(HALO_0*S1*S2)+(NT0+1-(tt))*HALO_0*HALO_1*S2+LIN3D(i,j,(t)%HALO_0,S1,S2,HALO_0)
+#define B_P1_offset(tt, ti, tj, t, i, j) (tt)*(S0*HALO_1*(N2+HALO_2))+(tj)*(S0*HALO_1*S2)+(NT1+1-(ti))*S0*HALO_1*HALO_2+LIN3D(j,t,(i)%HALO_1,S2,S0,HALO_1)
+#define B_P2_offset(tt, ti, tj, t, i, j) (ti)*((N0+HALO_0)*S1*HALO_2)+(tt)*(S0*S1*HALO_2)+(NT2+1-(tj))*HALO_0*S1*HALO_2+LIN3D(t,i,(j)%HALO_2,S0,S1,HALO_2)
+
+Each component is separately described for Pt  below:
+
+  (tj)*(HALO_0*(N1+HALO_1)*S2)+(ti)*(HALO_0*S1*S2)  
+-- This is the mapping from tile IDs (origins made dense) to the starting address of a tile face.
+HALO_0 x S1 x S2 is the size of the face, making up the offset within one row
+of faces. The total size of a row of faces is the size of the iteration space +
+1 halo, since most halos overlap with a face of another.
+
+  (NT0+1-(tt))*HALO_0*HALO_1*S2
+-- This part is the diagonal projection of the tile faces to avoid overwriting
+the halo region  You have an extra 1 for the input halo of the first tile (in
+a row of faces).
+
+  LIN3D(i,j,(t)%HALO_0,S1,S2,HALO_0)
+-- linearized 3D access to the face defined by S1xS2xHALO_0. This is the memory
+layout within a tile face.
+
+The auxiliary array uses a simple UOV based allocation: [t,i,j] ->
+[t-i+N1,t-j+N2] (applied in the tile space). You don't have contiguity across
+tiles in this array (it is useless to have it).
+
+
+Mem Alloc Test
+The cpp file mem-alloc-test tests the allocation only. Each tile uses single
+assignment scratchpad register, including the halos. The code reads each face +
+the aux array with 1 loop nest each, computes using SA registers, and then
+outputs the faces with 1 loop nest each as well.
+
+The faces Pi and Pj actually writes more data than necessary; each tile writes
+the inputs that came in to its halos as well. This is to simplify the
+initialization of data, and is only necessary for partial tiles.
+
+Actor Test
+The cpp file actor-test is currently testing the read actors. It keeps the
+original SA register as in the mem-alloc-test, but the inputs are done through
+FIFOs. Some of the data packs from the input FIFO is  
+ 
+
+For both tests, ouputs are supposed to be integers from 1 to NxN. If you
+initialize the input with this set of values, and use the default update
+function (average of all 5pt), you keep getting the same value. This was
+sufficient to test that all communications are happens as intended. Although
+the values remains the same, where they are stored is constantly changing, and
+hence you do still catch errors with high probability.
+
+
+
+
+
+
